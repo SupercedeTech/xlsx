@@ -159,6 +159,7 @@ test-suite data-test
                , xml-conduit >= 1.1.0
                , conduit
                , filepath 
+               , deepseq
   Default-Language:     Haskell2010
 
 source-repository head
