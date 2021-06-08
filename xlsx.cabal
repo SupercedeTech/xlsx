@@ -145,6 +145,7 @@ test-suite data-test
                , bytestring
                , containers
                , Diff >= 0.3.0
+               , directory
                , groom
                , lens >= 3.8 && < 5.1
                , mtl
