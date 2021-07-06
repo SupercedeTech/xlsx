@@ -13,3 +13,11 @@ samples
 result
 result-doc
 *.lock
+*.o
+*.hi
+*.prof
+*.aux
+*.hp
+*.ps
+.envrc
+.direnv
