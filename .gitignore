@@ -21,3 +21,4 @@ result-doc
 *.ps
 .envrc
 .direnv
+cabal.project.local
