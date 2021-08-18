@@ -90,4 +90,3 @@ main = defaultMain $
     , AutoFilterTests.tests
     , StreamTests.tests
     ]
-
