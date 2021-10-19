@@ -136,7 +136,7 @@ type SharedStringMap = V.Vector Text
 -- By far we do not bother with it.
 data ExcelValueType
   = TS      -- ^ shared string
-  | TStr    -- ^ original string
+  | TStr    -- ^ either an inline string ("inlineStr") or a formula string ("str")
   | TN      -- ^ number
   | TB      -- ^ boolean
   | TE      -- ^ excell error, the sheet can contain error values, for example if =1/0, causes division by zero
@@ -264,15 +264,20 @@ getOrParseSharedStrings = do
     Just strs -> pure strs
     Nothing -> do
       sharedStrsSel <- liftZip $ Zip.mkEntrySelector "xl/sharedStrings.xml"
-      let state0 = initialSharedString
-      byteSrc <- liftZip $ Zip.getEntrySource sharedStrsSel
-      st <- runExpat state0 byteSrc $ \evs -> forM_ evs $ \ev -> do
-        mTxt <- parseSharedString ev
-        for_ mTxt $ \txt ->
-          ss_list %= (`DL.snoc` txt)
-      let sharedStrings = V.fromList $ DL.toList $ _ss_list st
-      liftIO $ writeIORef sharedStringsRef $ Just sharedStrings
-      pure sharedStrings
+      hasSharedStrs <- liftZip $ Zip.doesEntryExist sharedStrsSel
+      sharedStrs <-
+        if not hasSharedStrs
+        then pure mempty
+        else do
+          let state0 = initialSharedString
+          byteSrc <- liftZip $ Zip.getEntrySource sharedStrsSel
+          st <- runExpat state0 byteSrc $ \evs -> forM_ evs $ \ev -> do
+            mTxt <- parseSharedString ev
+            for_ mTxt $ \txt ->
+              ss_list %= (`DL.snoc` txt)
+          pure $ V.fromList $ DL.toList $ _ss_list st
+      liftIO $ writeIORef sharedStringsRef $ Just sharedStrs
+      pure sharedStrs
 
 -- | Returns information about the workbook, found in
 -- xl/workbook.xml. The result is cached so the XML will only be
@@ -598,15 +603,10 @@ matchHexpatEvent ev = case ev of
       {-# SCC "append_text_buf" #-} (ps_text_buf <>= txt)
     pure Nothing
   StartElement "c" attrs -> Nothing <$ (setCoord attrs *> setType attrs *> setStyle attrs)
+  StartElement "is" _ -> Nothing <$ (ps_is_in_val .= True)
+  EndElement "is" -> Nothing <$ finaliseCellValue
   StartElement "v" _ -> Nothing <$ (ps_is_in_val .= True)
-  EndElement "v" -> {-# SCC "handle_EndElementV" #-} do
-    txt <- gets _ps_text_buf
-    {-# SCC "call_addCellToRow" #-} addCellToRow txt
-    {-# SCC "call_modify_endelemV" #-} modify' $ \st ->
-      st { _ps_is_in_val = False
-         , _ps_text_buf = mempty
-         }
-    pure Nothing
+  EndElement "v" -> Nothing <$ finaliseCellValue
   -- If beginning of row, empty the state and return nothing.
   -- We don't know if there is anything in the state, the user may have
   -- decided to <row> <row> (not closing). In any case it's the beginning of a new row
@@ -628,6 +628,17 @@ matchHexpatEvent ev = case ev of
       throwError $ HexpatParseError err
     pure Nothing
   _ -> pure Nothing
+
+{-# INLINE finaliseCellValue #-}
+finaliseCellValue ::
+  ( MonadError SheetErrors m, HasSheetState m ) => m ()
+finaliseCellValue = do
+  txt <- gets _ps_text_buf
+  addCellToRow txt
+  modify' $ \st ->
+    st { _ps_is_in_val = False
+       , _ps_text_buf = mempty
+       }
 
 -- | Update state coordinates accordingly to @parseCoordinates@
 {-# SCC setCoord #-}
@@ -682,7 +693,9 @@ parseType list =
       case valText of
         "n"   -> Right TN
         "s"   -> Right TS
+         -- "Cell containing a formula string". Probably shouldn't be TStr..
         "str" -> Right TStr
+        "inlineStr" -> Right TStr
         "b"   -> Right TB
         "e"   -> Right TE
         other -> Left $ UnkownType other list
