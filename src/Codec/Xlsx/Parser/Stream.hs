@@ -1,19 +1,20 @@
-{-# LANGUAGE PackageImports #-}
-{-# LANGUAGE ConstraintKinds     #-}
-{-# LANGUAGE DeriveAnyClass      #-}
-{-# LANGUAGE DeriveGeneric       #-}
+{-# LANGUAGE CPP                        #-}
+{-# LANGUAGE ConstraintKinds            #-}
+{-# LANGUAGE DeriveAnyClass             #-}
+{-# LANGUAGE DeriveGeneric              #-}
+{-# LANGUAGE DerivingStrategies         #-}
+{-# LANGUAGE FlexibleContexts           #-}
 {-# LANGUAGE GeneralizedNewtypeDeriving #-}
-{-# LANGUAGE DerivingStrategies  #-}
-{-# LANGUAGE FlexibleContexts    #-}
-{-# LANGUAGE LambdaCase          #-}
-{-# LANGUAGE OverloadedStrings   #-}
-{-# LANGUAGE RankNTypes          #-}
-{-# LANGUAGE RecordWildCards     #-}
-{-# LANGUAGE ScopedTypeVariables #-}
-{-# LANGUAGE StrictData          #-}
-{-# LANGUAGE TemplateHaskell     #-}
-{-# LANGUAGE UndecidableInstances #-}
-{-# LANGUAGE CPP #-}
+{-# LANGUAGE LambdaCase                 #-}
+{-# LANGUAGE OverloadedStrings          #-}
+{-# LANGUAGE PackageImports             #-}
+{-# LANGUAGE RankNTypes                 #-}
+{-# LANGUAGE RecordWildCards            #-}
+{-# LANGUAGE ScopedTypeVariables        #-}
+{-# LANGUAGE StrictData                 #-}
+{-# LANGUAGE TemplateHaskell            #-}
+{-# LANGUAGE TypeApplications           #-}
+{-# LANGUAGE UndecidableInstances       #-}
 
 -- |
 -- Module      : Codex.Xlsx.Parser.Stream
@@ -34,7 +35,6 @@
 -- Inside the XlsxM monad, you can stream 'SheetItem's (a row) from a
 -- particular sheet, using 'readSheet', which is callback-based and tied to IO.
 --
-{-# LANGUAGE TypeApplications    #-}
 module Codec.Xlsx.Parser.Stream
   ( XlsxM
   , runXlsxM
@@ -55,59 +55,58 @@ module Codec.Xlsx.Parser.Stream
   , si_cell_row
   -- * Errors
   , SheetErrors(..)
-  {-- TODO: check if these errors could be thrown exposed to API users or not
   , AddCellErrors(..)
   , CoordinateErrors(..)
   , TypeError(..)
-  --}
   ) where
 
 import qualified "zip" Codec.Archive.Zip as Zip
+import Codec.Xlsx.Types.Cell
+import Codec.Xlsx.Types.Common
+import Codec.Xlsx.Types.Internal (RefId (..))
+import Codec.Xlsx.Types.Internal.Relationships (Relationship (..),
+                                                Relationships (..))
+import Conduit (PrimMonad, (.|))
+import qualified Conduit as C
 import qualified Data.Vector as V
-import           Codec.Xlsx.Types.Cell
-import           Codec.Xlsx.Types.Internal (RefId(..))
-import           Codec.Xlsx.Types.Common
-import           Codec.Xlsx.Types.Internal.Relationships (Relationship(..), Relationships(..))
-import           Conduit                         (PrimMonad, (.|))
-import qualified Conduit                         as C
 #ifdef USE_MICROLENS
-import           Lens.Micro
-import           Lens.Micro.TH
-import           Lens.Micro.Mtl
-import           Lens.Micro.GHC ()
-import           Lens.Micro.Platform
+import Lens.Micro
+import Lens.Micro.GHC ()
+import Lens.Micro.Mtl
+import Lens.Micro.Platform
+import Lens.Micro.TH
 #else
-import           Control.Lens
+import Control.Lens
 #endif
-import           Control.Monad.Catch
-import           Control.Monad.Except
-import           Control.Monad.Reader
-import           Control.Monad.State.Strict
-import           Data.Bifunctor
-import           Data.ByteString (ByteString)
-import qualified Data.ByteString                 as BS
-import           Data.Conduit                    (ConduitT)
+import Codec.Xlsx.Parser.Internal
+import Control.Monad.Catch
+import Control.Monad.Except
+import Control.Monad.Reader
+import Control.Monad.State.Strict
+import Data.Bifunctor
+import Data.ByteString (ByteString)
+import qualified Data.ByteString as BS
+import Data.Conduit (ConduitT)
 import qualified Data.DList as DL
-import           Data.Foldable
-import           Data.IORef
+import Data.Foldable
+import Data.IORef
 import Data.IntMap.Strict (IntMap)
 import qualified Data.IntMap.Strict as IntMap
 import qualified Data.Map.Strict as M
-import           Data.Text                       (Text)
+import Data.Text (Text)
 import qualified Data.Text as T
-import qualified Data.Text.Read                  as Read
-import qualified Data.Text.Lazy.Builder as TB
 import qualified Data.Text.Lazy as LT
-import           Data.Traversable                (for)
-import           Data.XML.Types
-import           GHC.Generics
-import Codec.Xlsx.Parser.Internal
+import qualified Data.Text.Lazy.Builder as TB
+import qualified Data.Text.Read as Read
+import Data.Traversable (for)
+import Data.XML.Types
+import GHC.Generics
 
-import Text.XML.Expat.SAX as Hexpat
-import Text.XML.Expat.Internal.IO as Hexpat
+import qualified Codec.Xlsx.Parser.Stream.HexpatInternal as HexpatInternal
 import Control.Monad.Base
 import Control.Monad.Trans.Control
-import qualified Codec.Xlsx.Parser.Stream.HexpatInternal as HexpatInternal
+import Text.XML.Expat.Internal.IO as Hexpat
+import Text.XML.Expat.SAX as Hexpat
 
 #ifdef USE_MICROLENS
 (<>=) :: (MonadState s m, Monoid a) => ASetter' s a -> a -> m ()
@@ -127,7 +126,7 @@ data SheetItem = MkSheetItem
   } deriving stock (Generic, Show)
 makeLenses 'MkSheetItem
 
-type SharedStringMap = V.Vector Text
+type SharedStringsMap = V.Vector Text
 
 -- | Type of the excel value
 --
@@ -145,16 +144,16 @@ data ExcelValueType
 
 -- | State for parsing sheets
 data SheetState = MkSheetState
-  { _ps_row            :: ~CellRow        -- ^ Current row
-  , _ps_sheet_index    :: Int             -- ^ Current sheet ID (AKA 'sheetInfoSheetId')
-  , _ps_cell_row_index :: Int             -- ^ Current row number
-  , _ps_cell_col_index :: Int             -- ^ Current column number
-  , _ps_cell_style     :: Maybe Int
-  , _ps_is_in_val      :: Bool            -- ^ Flag for indexing wheter the parser is in value or not
-  , _ps_shared_strings :: SharedStringMap -- ^ Shared string map
-  , _ps_type           :: ExcelValueType  -- ^ The last detected value type
+  { _ps_row             :: ~CellRow        -- ^ Current row
+  , _ps_sheet_index     :: Int             -- ^ Current sheet ID (AKA 'sheetInfoSheetId')
+  , _ps_cell_row_index  :: Int             -- ^ Current row number
+  , _ps_cell_col_index  :: Int             -- ^ Current column number
+  , _ps_cell_style      :: Maybe Int
+  , _ps_is_in_val       :: Bool            -- ^ Flag for indexing wheter the parser is in value or not
+  , _ps_shared_strings  :: SharedStringsMap -- ^ Shared string map
+  , _ps_type            :: ExcelValueType  -- ^ The last detected value type
 
-  , _ps_text_buf :: Text
+  , _ps_text_buf        :: Text
   -- ^ for hexpat only, which can break up char data into multiple events
   , _ps_worksheet_ended :: Bool
   -- ^ For hexpat only, which can throw errors right at the end of the sheet
@@ -163,21 +162,21 @@ data SheetState = MkSheetState
 makeLenses 'MkSheetState
 
 -- | State for parsing shared strings
-data SharedStringState = MkSharedStringState
-  { _ss_string    :: TB.Builder -- ^ String we are parsing
-  , _ss_list :: DL.DList Text -- ^ list of shared strings
+data SharedStringsState = MkSharedStringsState
+  { _ss_string :: TB.Builder -- ^ String we are parsing
+  , _ss_list   :: DL.DList Text -- ^ list of shared strings
   } deriving stock (Generic, Show)
-makeLenses 'MkSharedStringState
+makeLenses 'MkSharedStringsState
 
 type HasSheetState = MonadState SheetState
-type HasSharedStringState = MonadState SharedStringState
+type HasSharedStringsState = MonadState SharedStringsState
 
 -- | Represents sheets from the workbook.xml file. E.g.
 -- <sheet name="Data" sheetId="1" state="hidden" r:id="rId2" /
 data SheetInfo = SheetInfo
-  { sheetInfoName :: Text,
+  { sheetInfoName    :: Text,
     -- | The r:id attribute value.
-    sheetInfoRelId :: RefId,
+    sheetInfoRelId   :: RefId,
     -- | The sheetId attribute value
     sheetInfoSheetId :: Int
   } deriving (Show, Eq)
@@ -191,8 +190,8 @@ makeLenses 'WorkbookInfo
 
 data XlsxMState = MkXlsxMState
   { _xs_shared_strings :: IORef (Maybe (V.Vector Text))
-  , _xs_workbook_info :: IORef (Maybe WorkbookInfo)
-  , _xs_relationships :: IORef (Maybe Relationships)
+  , _xs_workbook_info  :: IORef (Maybe WorkbookInfo)
+  , _xs_relationships  :: IORef (Maybe Relationships)
   }
 
 newtype XlsxM a = XlsxM {_unXlsxM :: ReaderT XlsxMState Zip.ZipArchive a}
@@ -225,25 +224,25 @@ initialSheetState = MkSheetState
   }
 
 -- | Initial parsing state
-initialSharedString :: SharedStringState
-initialSharedString = MkSharedStringState
+initialSharedStrings :: SharedStringsState
+initialSharedStrings = MkSharedStringsState
   { _ss_string = mempty
   , _ss_list = mempty
   }
 
 -- | Parse shared string entry from xml event and return it once
 -- we've reached the end of given element
-{-# SCC parseSharedString #-}
-parseSharedString
+{-# SCC parseSharedStrings #-}
+parseSharedStrings
   :: ( MonadThrow m
-     , HasSharedStringState m
+     , HasSharedStringsState m
      )
   => HexpatEvent -> m (Maybe Text)
-parseSharedString = \case
+parseSharedStrings = \case
   StartElement "t" _ -> Nothing <$ (ss_string .= mempty)
-  EndElement "t" -> Just . LT.toStrict . TB.toLazyText <$> gets _ss_string
-  CharacterData txt -> Nothing <$ (ss_string <>= TB.fromText txt)
-  _ -> pure Nothing
+  EndElement "t"     -> Just . LT.toStrict . TB.toLazyText <$> gets _ss_string
+  CharacterData txt  -> Nothing <$ (ss_string <>= TB.fromText txt)
+  _                  -> pure Nothing
 
 -- | Run a series of actions on an Xlsx file
 runXlsxM :: MonadIO m => FilePath -> XlsxM a -> m a
@@ -255,12 +254,12 @@ runXlsxM xlsxFile (XlsxM act) = do
 liftZip :: Zip.ZipArchive a -> XlsxM a
 liftZip = XlsxM . ReaderT . const
 
-{-# SCC getOrParseSharedStrings #-}
-getOrParseSharedStrings :: XlsxM (V.Vector Text)
-getOrParseSharedStrings = do
+{-# SCC getOrParseSharedStringss #-}
+getOrParseSharedStringss :: XlsxM (V.Vector Text)
+getOrParseSharedStringss = do
   sharedStringsRef <- asks _xs_shared_strings
-  mSharedStrings <- liftIO $ readIORef sharedStringsRef
-  case mSharedStrings of
+  mSharedStringss <- liftIO $ readIORef sharedStringsRef
+  case mSharedStringss of
     Just strs -> pure strs
     Nothing -> do
       sharedStrsSel <- liftZip $ Zip.mkEntrySelector "xl/sharedStrings.xml"
@@ -269,10 +268,10 @@ getOrParseSharedStrings = do
         if not hasSharedStrs
         then pure mempty
         else do
-          let state0 = initialSharedString
+          let state0 = initialSharedStrings
           byteSrc <- liftZip $ Zip.getEntrySource sharedStrsSel
           st <- runExpat state0 byteSrc $ \evs -> forM_ evs $ \ev -> do
-            mTxt <- parseSharedString ev
+            mTxt <- parseSharedStrings ev
             for_ mTxt $ \txt ->
               ss_list %= (`DL.snoc` txt)
           pure $ V.fromList $ DL.toList $ _ss_list st
@@ -347,7 +346,7 @@ sheetIdToRelId sheetId = do
 sheetIdToEntrySelector :: Int -> XlsxM (Maybe Zip.EntrySelector)
 sheetIdToEntrySelector sheetId = do
   sheetIdToRelId sheetId >>= \case
-    Nothing -> pure Nothing
+    Nothing  -> pure Nothing
     Just rid -> relIdToEntrySelector rid
 
 -- If the given sheet number exists, returns Just a conduit source of the stream
@@ -416,7 +415,7 @@ runExpatForSheet initState byteSource inner =
     handler evs = forM_ evs $ \ev -> do
       parseRes <- runExceptT $ matchHexpatEvent ev
       case parseRes of
-        Left err -> error $ "error after matchHexpatEvent: " <> show err
+        Left err -> throwM err
         Right (Just cellRow)
           | not (IntMap.null cellRow) -> do
               rowNum <- use ps_cell_row_index
@@ -468,7 +467,7 @@ readSheet sheetId inner = do
   case mSrc of
     Nothing -> pure False
     Just sourceSheetXml -> do
-      sharedStrs <- getOrParseSharedStrings
+      sharedStrs <- getOrParseSharedStringss
       let sheetState0 = initialSheetState
             & ps_shared_strings .~ sharedStrs
             & ps_sheet_index .~ sheetId
@@ -488,7 +487,7 @@ countRowsInSheet sheetId = do
     runExpat @Int @ByteString @ByteString 0 sourceSheetXml $ \evs ->
       forM_ evs $ \case
         StartElement "row" _ -> modify' (+1)
-        _ -> pure ()
+        _                    -> pure ()
 
 -- | Same as 'countRowsInSheet', except here the sheet is identified by
 -- case-insensitive name.
@@ -510,7 +509,7 @@ data AddCellErrors
   = ReadError -- ^ Could not read current cell value
       Text    -- ^ Original value
       String  -- ^ Error message
-  | SharedStringNotFound -- ^ Could not find string by index in shared string table
+  | SharedStringsNotFound -- ^ Could not find string by index in shared string table
       Int                -- ^ Given index
       (V.Vector Text)      -- ^ Given shared strings to lookup in
   deriving Show
@@ -519,11 +518,11 @@ data AddCellErrors
 --
 -- If it's a string, we try to get it our of a shared string table
 {-# SCC parseValue #-}
-parseValue :: SharedStringMap -> Text -> ExcelValueType -> Either AddCellErrors CellValue
+parseValue :: SharedStringsMap -> Text -> ExcelValueType -> Either AddCellErrors CellValue
 parseValue sstrings txt = \case
   TS -> do
     (idx, _) <- ReadError txt `first` Read.decimal @Int txt
-    string <- maybe (Left $ SharedStringNotFound idx sstrings) Right $ {-# SCC "sstrings_lookup_scc" #-}  (sstrings ^? ix idx)
+    string <- maybe (Left $ SharedStringsNotFound idx sstrings) Right $ {-# SCC "sstrings_lookup_scc" #-}  (sstrings ^? ix idx)
     Right $ CellText string
   TStr -> pure $ CellText txt
   TN -> bimap (ReadError txt) (CellDouble . fst) $ Read.double txt
@@ -680,7 +679,7 @@ parseStyle list =
   case findName "s" list of
     Nothing -> pure Nothing
     Just (_nm, valTex) -> case Read.decimal valTex of
-      Left err -> Left (InvalidStyleRef valTex err)
+      Left err        -> Left (InvalidStyleRef valTex err)
       Right (i, _rem) -> pure $ Just i
 
 -- | Parse value type
@@ -691,14 +690,14 @@ parseType list =
     Nothing -> pure Untyped
     Just (_nm, valText)->
       case valText of
-        "n"   -> Right TN
-        "s"   -> Right TS
+        "n"         -> Right TN
+        "s"         -> Right TS
          -- "Cell containing a formula string". Probably shouldn't be TStr..
-        "str" -> Right TStr
+        "str"       -> Right TStr
         "inlineStr" -> Right TStr
-        "b"   -> Right TB
-        "e"   -> Right TE
-        other -> Left $ UnkownType other list
+        "b"         -> Right TB
+        "e"         -> Right TE
+        other       -> Left $ UnkownType other list
 
 -- | Parse coordinates from a list of xml elements if such were found on "r" key
 {-# SCC parseCoordinates #-}
