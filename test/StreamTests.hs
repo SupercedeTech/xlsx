@@ -96,7 +96,7 @@ tests =
 readWrite :: Xlsx -> IO ()
 readWrite input = do
   BS.writeFile "testinput.xlsx" (toBs input)
-  items <- runXlsxM "testinput.xlsx" $ collectItems 1
+  items <- fmap (toListOf (traversed . si_row)) $ runXlsxM "testinput.xlsx" $ collectItems 1
   bs <- runConduitRes $ void (SW.writeXlsx SW.defaultSettings $ C.yieldMany items) .| C.foldC
   case toXlsxEither $ LB.fromStrict bs of
     Right result  ->
@@ -110,7 +110,7 @@ sharedStringInputSameAsOutput someText =
   if someText  == out then Right msg  else Left msg
 
   where
-    out = fst $ evalState (SW.getSetNumber someText) SW.initialSharedString
+    out = fst $ evalState (SW.upsertSharedString someText) SW.initialSharedString
     msg = printf "'%s' = '%s'" (Text.unpack out) (Text.unpack someText)
 
 -- test if unique strings actually get set in the map as keys
@@ -119,7 +119,7 @@ sharedStringInputTextsIsSameAsMapLength someTexts =
     length result == length unqTexts
   where
    result  :: Map Text Int
-   result = view SW.string_map $ traverse SW.getSetNumber someTexts `execState` SW.initialSharedString
+   result = view SW.string_map $ traverse SW.upsertSharedString someTexts `execState` SW.initialSharedString
    unqTexts :: Set Text
    unqTexts = Set.fromList someTexts
 
@@ -129,7 +129,7 @@ sharedStringInputTextsIsSameAsValueSetLength someTexts =
     length result == length unqTexts
   where
    result  :: Set Int
-   result = setOf (SW.string_map . traversed) $ traverse SW.getSetNumber someTexts `execState` SW.initialSharedString
+   result = setOf (SW.string_map . traversed) $ traverse SW.upsertSharedString someTexts `execState` SW.initialSharedString
    unqTexts :: Set Text
    unqTexts = Set.fromList someTexts
 
@@ -204,6 +204,6 @@ inlineStringsAreParsed = do
               )
             ]
         ]
-  expected @==? map _si_cell_row items
+  expected @==? (items ^.. traversed . si_row . ri_cell_row)
 
 #endif

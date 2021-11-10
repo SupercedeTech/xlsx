@@ -14,7 +14,7 @@
 module Codec.Xlsx.Writer.Stream
   ( writeXlsx
   , writeXlsxWithSharedStrings
-  , WriteSettings(..)
+  , SheetWriteSettings(..)
   , defaultSettings
   , wsSheetView
   , wsZip
@@ -73,16 +73,16 @@ import Text.XML.Stream.Render
 import Text.XML.Unresolved (elementToEvents)
 
 
-mapFold :: MonadState SharedStringState m => SheetItem  -> m [(Text,Int)]
-mapFold  row =
-  traverse getSetNumber items
+upsertSharedStrings :: MonadState SharedStringState m => RowItem -> m [(Text,Int)]
+upsertSharedStrings row =
+  traverse upsertSharedString items
   where
     items :: [Text]
-    items = row ^.. si_cell_row . traversed . cellValue . _Just . _CellText
+    items = row ^.. ri_cell_row . traversed . cellValue . _Just . _CellText
 
 -- | Process sheetItems into shared strings structure to be put into
 --   'writeXlsxWithSharedStrings'
-sharedStrings :: Monad m  => ConduitT SheetItem b m (Map Text Int)
+sharedStrings :: Monad m  => ConduitT RowItem b m (Map Text Int)
 sharedStrings = void sharedStringsStream .| CL.foldMap (uncurry Map.singleton)
 
 -- | creates a unique number for every encountered string in the stream
@@ -93,65 +93,51 @@ sharedStrings = void sharedStringsStream .| CL.foldMap (uncurry Map.singleton)
 --   but I don't think conduit provides a way of getting that out.
 --   use 'sharedStrings' to just get the map
 sharedStringsStream :: Monad m  =>
-  ConduitT SheetItem (Text, Int) m (Map Text Int)
+  ConduitT RowItem (Text, Int) m (Map Text Int)
 sharedStringsStream = fmap (view string_map) $ C.execStateC initialSharedString $
-  CL.mapFoldableM mapFold
+  CL.mapFoldableM upsertSharedStrings
 
--- note that currently we support only a single sheet.
-data WriteSettings = MkWriteSettings
+-- | Settings for writing a single sheet.
+data SheetWriteSettings = MkSheetWriteSettings
   { _wsSheetView        :: [SheetView]
-  , _wsZip              :: ZipOptions
+  , _wsZip              :: ZipOptions -- ^ Enable zipOpt64=True if you intend writing large xlsx files, zip needs 64bit for files over 4gb.
   , _wsColumnProperties :: [ColumnsProperties]
   , _wsRowProperties    :: Map Int RowProperties
   , _wsStyles           :: Styles
   }
-instance Show  WriteSettings where
+instance Show  SheetWriteSettings where
   -- ZipOptions lacks a show instance-}
-  show (MkWriteSettings s _ y r _) = printf "MkWriteSettings{ _wsSheetView=%s, _wsColumnProperties=%s, _wsZip=defaultZipOptions, _wsRowProperties=%s }" (show s) (show y) (show r)
-makeLenses ''WriteSettings
+  show (MkSheetWriteSettings s _ y r _) = printf "MkSheetWriteSettings{ _wsSheetView=%s, _wsColumnProperties=%s, _wsZip=defaultZipOptions, _wsRowProperties=%s }" (show s) (show y) (show r)
+makeLenses ''SheetWriteSettings
 
-defaultSettings :: WriteSettings
-defaultSettings = MkWriteSettings
+defaultSettings :: SheetWriteSettings
+defaultSettings = MkSheetWriteSettings
   { _wsSheetView = []
   , _wsColumnProperties = []
   , _wsRowProperties = mempty
   , _wsStyles = emptyStyles
   , _wsZip = defaultZipOptions {
-  zipOpt64 = False -- TODO renable
+  zipOpt64 = False
   -- There is a magick number in the zip archive package,
   -- https://hackage.haskell.org/package/zip-archive-0.4.1/docs/src/Codec.Archive.Zip.html#local-6989586621679055672
   -- if we enable 64bit the number doesn't align causing the test to fail.
-  -- I'll make the test pass, and after that I'll make the
   }
   }
 
 
---   To validate the result is correct xml:
---
---   @
---   docker run -v $(pwd):/app/xlsx-validator/xlsx -it vindvaki/xlsx-validator xlsx-validator xlsx/yourfile.xlsx
---   @
---
---   TODO: package that program for nix and make a unit test out of it.
---   it's *really* usefull.
---
---   This will put the xlsx project root in the current working
---   directory of xlsx validator,
---   allowing you to run that program on the output from
---   streaming (which in this example was written to out/out.xlsx).
---   This gives a much more descriptive error reporting than excel.
--- | Transform a 'SheetItem' stream into a stream that creates the xlsx file format
+
+-- | Transform a 'RowItem' stream into a stream that creates the xlsx file format
 --   (to be consumed by sinkfile for example)
 --  This first runs 'sharedStrings' and then 'writeXlsxWithSharedStrings'.
 --  If you want xlsx files this is the most obvious function to use.
 --  the others are exposed in case you can cache the shared strings for example.
 --
---  Note that the current concatination concatinates everything into a single sheet.
+--  Note that the current implementation concatenates everything into a single sheet.
 --  In other words there is no tab support yet.
 writeXlsx :: MonadThrow m
     => PrimMonad m
-    => WriteSettings -- ^ use 'defaultSettings'
-    -> ConduitT () SheetItem m () -- ^ the conduit producing sheetitems
+    => SheetWriteSettings -- ^ use 'defaultSettings'
+    -> ConduitT () RowItem m () -- ^ the conduit producing sheetitems
     -> ConduitT () ByteString m Word64 -- ^ result conduit producing xlsx files
 writeXlsx settings sheetC = do
     sstrings  <- sheetC .| sharedStrings
@@ -160,31 +146,29 @@ writeXlsx settings sheetC = do
 
 -- TODO maybe should use bimap instead: https://hackage.haskell.org/package/bimap-0.4.0/docs/Data-Bimap.html
 -- it guarantees uniqueness of both text and int
--- | This write excell file with a shared strings lookup table.
+-- | This write Excel file with a shared strings lookup table.
 --   It appears that it is optional.
 --   Failed lookups will result in valid xlsx.
 --   There are several conditions on shared strings,
 --
 --      1. Every text to int is unique on both text and int.
---      2. Every Int should have a gap no greater then 1. [("xx", 3), ("yy", 4)] is okay, whereas [("xx", 3), ("yy", 5)] is not.
+--      2. Every Int should have a gap no greater than 1. [("xx", 3), ("yy", 4)] is okay, whereas [("xx", 3), ("yy", 5)] is not.
 --      3. It's expected this starts from 0.
 --
 --   Use 'sharedStringsStream' to get a good shared strings table.
 --   This is provided because the user may have a more efficient way of
---   constructing this table then the library can provide,
---   for example trough database operations.
+--   constructing this table than the library can provide,
+--   for example through database operations.
 writeXlsxWithSharedStrings :: MonadThrow m => PrimMonad m
-    => WriteSettings
+    => SheetWriteSettings
     -> Map Text Int -- ^ shared strings table
-    -> ConduitT () SheetItem m ()
+    -> ConduitT () RowItem m ()
     -> ConduitT () ByteString m Word64
-writeXlsxWithSharedStrings settings sharedStrings' items = do
-  res  <- combinedFiles settings sharedStrings' items .| zipStream (settings ^. wsZip)
-  -- yield (LBS.toStrict $ BS.toLazyByteString $ BS.word32LE 0x06054b50) -- insert magic number for fun.
-  pure res
+writeXlsxWithSharedStrings settings sharedStrings' items =
+  combinedFiles settings sharedStrings' items .| zipStream (settings ^. wsZip)
 
 -- massive amount of boilerplate needed for excel to function
-boilerplate :: forall m . PrimMonad m  => WriteSettings -> Map Text Int -> [(ZipEntry,  ZipData m)]
+boilerplate :: forall m . PrimMonad m  => SheetWriteSettings -> Map Text Int -> [(ZipEntry,  ZipData m)]
 boilerplate settings sharedStrings' =
   [ (zipEntry "xl/sharedStrings.xml", ZipDataSource $ writeSst sharedStrings' .| eventsToBS)
   , (zipEntry "[Content_Types].xml", ZipDataSource $ writeContentTypes .| eventsToBS)
@@ -195,9 +179,9 @@ boilerplate settings sharedStrings' =
   ]
 
 combinedFiles :: PrimMonad m
-  => WriteSettings
+  => SheetWriteSettings
   -> Map Text Int
-  -> ConduitT () SheetItem m ()
+  -> ConduitT () RowItem m ()
   -> ConduitT () (ZipEntry, ZipData m) m ()
 combinedFiles settings sharedStrings' items =
   C.yieldMany $
@@ -208,8 +192,9 @@ combinedFiles settings sharedStrings' items =
 el :: Monad m => Name -> Monad m => forall i.  ConduitT i Event m () -> ConduitT i Event m ()
 el x = tag x mempty
 
---   Clark notation a lot for xml namespaces:
+--   Clark notation is used a lot for xml namespaces in this module:
 --   <https://hackage.haskell.org/package/xml-types-0.3.8/docs/Data-XML-Types.html#t:Name>
+--   Name has an IsString instance which parses it
 override :: Monad m => Text -> Text -> forall i.  ConduitT i Event m ()
 override content' part =
     tag "{http://schemas.openxmlformats.org/package/2006/content-types}Override"
@@ -217,7 +202,7 @@ override content' part =
        <> attr "PartName" part) $ pure ()
 
 
--- | required by excell.
+-- | required by Excel.
 writeContentTypes :: Monad m => forall i.  ConduitT i Event m ()
 writeContentTypes = doc "{http://schemas.openxmlformats.org/package/2006/content-types}Types" $ do
     override "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet.main+xml" "/xl/workbook.xml"
@@ -227,7 +212,7 @@ writeContentTypes = doc "{http://schemas.openxmlformats.org/package/2006/content
     override "application/vnd.openxmlformats-package.relationships+xml" "/xl/_rels/workbook.xml.rels"
     override "application/vnd.openxmlformats-package.relationships+xml" "/_rels/.rels"
 
--- | required by excell.
+-- | required by Excel.
 writeWorkbook :: Monad m => forall i.  ConduitT i Event m ()
 writeWorkbook = doc (n_ "workbook") $ do
     el (n_ "sheets") $ do
@@ -258,10 +243,8 @@ writeWorkbookRels = doc (pr "Relationships") $  do
   relationship "styles.xml" 2 "http://schemas.openxmlformats.org/officeDocument/2006/relationships/styles"
 
 writeRootRels :: Monad m => forall i.  ConduitT i Event m ()
-writeRootRels = doc (pr "Relationships") $  do
+writeRootRels = doc (pr "Relationships") $
   relationship "xl/workbook.xml" 1 "http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument"
-  -- relationship "docProps/core.xml" "rId2" "http://schemas.openxmlformats.org/officeDocument/2006/relationships/metadata/core-properties"
-  -- relationship "docProps/app.xml" "rId3" "http://schemas.openxmlformats.org/officeDocument/2006/relationships/extended-properties"
 
 
 zipEntry :: Text -> ZipEntry
@@ -283,7 +266,7 @@ writeSst sharedStrings' = doc (n_ "sst") $
 writeEvents ::  PrimMonad m => ConduitT Event Builder m ()
 writeEvents = renderBuilder (def {rsPretty=False})
 
-sheetViews :: forall m . MonadReader WriteSettings m => forall i . ConduitT i Event m ()
+sheetViews :: forall m . MonadReader SheetWriteSettings m => forall i . ConduitT i Event m ()
 sheetViews = do
   sheetView <- view wsSheetView
 
@@ -307,31 +290,31 @@ setNameSpaceRec space xelm =
                                     y -> y
     }
 
-columns :: MonadReader WriteSettings m => ConduitT SheetItem Event m ()
+columns :: MonadReader SheetWriteSettings m => ConduitT RowItem Event m ()
 columns = do
   colProps <- view wsColumnProperties
   let cols :: Maybe TXML.Element
       cols = nonEmptyElListSimple (n_ "cols") $ map (toElement (n_ "col")) colProps
   traverse_ (C.yieldMany . elementToEvents . toXMLElement) cols
 
-writeWorkSheet :: MonadReader WriteSettings  m => Map Text Int  -> ConduitT SheetItem Event m ()
+writeWorkSheet :: MonadReader SheetWriteSettings  m => Map Text Int  -> ConduitT RowItem Event m ()
 writeWorkSheet sharedStrings' = doc (n_ "worksheet") $ do
     sheetViews
     columns
     el (n_ "sheetData") $ C.awaitForever (mapRow sharedStrings')
 
-mapRow :: MonadReader WriteSettings m => Map Text Int -> SheetItem -> ConduitT SheetItem Event m ()
+mapRow :: MonadReader SheetWriteSettings m => Map Text Int -> RowItem -> ConduitT RowItem Event m ()
 mapRow sharedStrings' sheetItem = do
   mRowProp <- preview $ wsRowProperties . ix rowIx . rowHeightLens . _Just . failing _CustomHeight _AutomaticHeight
   let rowAttr :: Attributes
       rowAttr = ixAttr <> fold (attr "ht" . txtd <$> mRowProp)
   tag (n_ "row") rowAttr $
-    void $ itraverse (mapCell sharedStrings' rowIx) (sheetItem ^. si_cell_row)
+    void $ itraverse (mapCell sharedStrings' rowIx) (sheetItem ^. ri_cell_row)
   where
-    rowIx = sheetItem ^. si_row_index
+    rowIx = sheetItem ^. ri_row_index
     ixAttr = attr "r" $ toAttrVal rowIx
 
-mapCell :: Monad m => Map Text Int -> Int -> Int -> Cell -> ConduitT SheetItem Event m ()
+mapCell :: Monad m => Map Text Int -> Int -> Int -> Cell -> ConduitT RowItem Event m ()
 mapCell sharedStrings' rix cix cell =
   when (has (cellValue . _Just) cell || has (cellStyle . _Just) cell) $
   tag (n_ "c") celAttr $
