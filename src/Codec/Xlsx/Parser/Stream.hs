@@ -165,7 +165,7 @@ data SheetState = MkSheetState
   , _ps_cell_row_index  :: Int             -- ^ Current row number
   , _ps_cell_col_index  :: Int             -- ^ Current column number
   , _ps_cell_style      :: Maybe Int
-  , _ps_is_in_val       :: Bool            -- ^ Flag for indexing wheter the parser is in value or not
+  , _ps_is_in_val       :: Bool            -- ^ Flag for indexing whether the parser is in value or not
   , _ps_shared_strings  :: SharedStringsMap -- ^ Shared string map
   , _ps_type            :: ExcelValueType  -- ^ The last detected value type
 
@@ -183,6 +183,14 @@ data SharedStringsState = MkSharedStringsState
   , _ss_list   :: DL.DList Text -- ^ list of shared strings
   } deriving stock (Generic, Show)
 makeLenses 'MkSharedStringsState
+
+-- | State for counting of non empty rows
+data CountNonEmptyRowsState = MkCountNonEmptyRowsState
+  { _cners_is_in_row  :: Bool -- ^ Flag for indexing whether the parser is in row or not
+  , _cners_is_in_cell :: Bool -- ^ Flag for indexing whether the parser is in cell or not
+  , _cners_count      :: Int  -- ^ Current count of non-empty rows (row with cells with values)
+  } deriving stock (Generic, Show)
+makeLenses 'MkCountNonEmptyRowsState
 
 type HasSheetState = MonadState SheetState
 type HasSharedStringsState = MonadState SharedStringsState
@@ -492,11 +500,35 @@ countRowsInSheet :: SheetIndex -> XlsxM (Maybe Int)
 countRowsInSheet (MkSheetIndex sheetId) = do
   mSrc :: Maybe (ConduitT () ByteString (C.ResourceT IO) ()) <-
     getSheetXmlSource sheetId
-  for mSrc $ \sourceSheetXml -> do
-    liftIO $ runExpat @Int @ByteString @ByteString 0 sourceSheetXml $ \evs ->
+  let st = MkCountNonEmptyRowsState False False 0
+  mResult <- for mSrc $ \sourceSheetXml -> do
+    liftIO $ runExpat @CountNonEmptyRowsState @ByteString @ByteString st sourceSheetXml $ \evs ->
       forM_ evs $ \case
-        StartElement "row" _ -> modify' (+1)
+        StartElement "row" _ -> modify' $ (cners_is_in_cell .~ False)
+                                        . (cners_is_in_row .~ True)
+
+        EndElement "row"     -> modify' $ (cners_is_in_cell .~ False)
+                                        . (cners_is_in_row .~ False)
+
+        StartElement "c" _   -> modify' $ cners_is_in_cell .~ True
+
+        EndElement "c"       -> modify' $ cners_is_in_cell .~ False
+
+        StartElement "v" _   -> do
+          isInRow  <- gets $ view cners_is_in_row
+          isInCell <- gets $ view cners_is_in_cell
+
+          -- to not count on each value/cell,
+          -- just mark as out of row/cell
+          if isInRow && isInCell
+          then modify' $ (cners_is_in_cell .~ False)
+                       . (cners_is_in_row .~ False)
+                       . (cners_count %~ succ)
+          else pure ()
+
         _                    -> pure ()
+
+  pure $ _cners_count <$> mResult
 
 -- | Return row from the state and empty it
 popRow :: HasSheetState m => m CellRow
