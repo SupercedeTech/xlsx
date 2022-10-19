@@ -46,6 +46,9 @@ module Codec.Xlsx.Parser.Stream
   , readSheet
   , countRowsInSheet
   , collectItems
+  -- ** Partial traversal
+  , Continue(..)
+  , readPartialSheet
   -- ** Index
   , SheetIndex
   , makeIndex
@@ -378,14 +381,30 @@ getSheetXmlSource sheetId = do
           Just <$> liftZip (Zip.getEntrySource sheetSel)
     _ -> pure Nothing
 
-{-# SCC runExpat #-}
 runExpat :: forall state tag text.
   (GenericXMLString tag, GenericXMLString text) =>
   state ->
   ConduitT () ByteString (C.ResourceT IO) () ->
   ([SAXEvent tag text] -> StateT state IO ()) ->
   IO state
-runExpat initialState byteSource handler = do
+runExpat initialState byteSource
+  = runPartialExpat initialState byteSource . ((Continue <$) .)
+
+-- | How to proceed with a partial sheet reading after the current point
+data Continue
+  = Stop
+  -- ^ Stop reading, and ignore the rest of the sheet
+  | Continue
+  -- ^ Continue reading
+
+{-# SCC runPartialExpat #-}
+runPartialExpat :: forall state tag text.
+  (GenericXMLString tag, GenericXMLString text) =>
+  state ->
+  ConduitT () ByteString (C.ResourceT IO) () ->
+  ([SAXEvent tag text] -> StateT state IO Continue) ->
+  IO state
+runPartialExpat initialState byteSource handler = do
   -- Set up state
   ref <- newIORef initialState
   -- Set up parser and callbacks
@@ -400,26 +419,39 @@ runExpat initialState byteSource handler = do
           Just err -> error $ "expat error: " <> show err
           Nothing -> do
             state0 <- liftIO $ readIORef ref
-            state1 <-
+            (continue, state1) <-
               {-# SCC "runExpat_runStateT_call" #-}
-              execStateT (handler $ map fst saxen) state0
+              runStateT (handler $ map fst saxen) state0
             writeIORef ref state1
-  C.runConduitRes $
-    byteSource .|
-    C.awaitForever (liftIO . processChunk False)
-  processChunk True BS.empty
+            pure continue
+
+      processChunks = do
+        mChunk <- C.await
+        case mChunk of
+          Nothing -> pure Continue
+          Just chunk -> do
+            continue <- liftIO $ processChunk False chunk
+            case continue of
+              Stop -> pure Stop
+              Continue -> processChunks
+  continue <- C.runConduitRes $ byteSource .| processChunks
+  -- If we stopped early, processing an empty chunk could lead to a
+  -- parser error (e.g. if we were in the middle of an XML element)
+  case continue of
+    Stop -> pure ()
+    Continue -> void $ processChunk True BS.empty
   readIORef ref
 
 runExpatForSheet ::
   SheetState ->
   ConduitT () ByteString (C.ResourceT IO) () ->
-  (SheetItem -> IO ()) ->
+  (SheetItem -> IO Continue) ->
   XlsxM ()
 runExpatForSheet initState byteSource inner =
-  void $ liftIO $ runExpat initState byteSource handler
+  void $ liftIO $ runPartialExpat initState byteSource handler
   where
     sheetName = _ps_sheet_index initState
-    handler evs = forM_ evs $ \ev -> do
+    parseEvent ev = do
       parseRes <- runExceptT $ matchHexpatEvent ev
       case parseRes of
         Left err -> throwM err
@@ -427,7 +459,13 @@ runExpatForSheet initState byteSource inner =
           | not (IntMap.null cellRow) -> do
               rowNum <- use ps_cell_row_index
               liftIO $ inner $ MkSheetItem sheetName $ MkRow rowNum cellRow
-        _ -> pure ()
+        _ -> pure Continue
+    handler evs = foldM
+      (\continue ev -> case continue of
+        Continue -> parseEvent ev
+        Stop -> pure Stop)
+      Continue
+      evs
 
 -- | this will collect the sheetitems in a list.
 --   useful for cases were memory is of no concern but a sheetitem
@@ -469,7 +507,25 @@ readSheet ::
   (SheetItem -> IO ()) ->
   -- | Returns False if sheet doesn't exist, or True otherwise
   XlsxM Bool
-readSheet (MkSheetIndex sheetId) inner = do
+readSheet sheetIndex
+  = readPartialSheet sheetIndex . ((Continue <$) .)
+
+-- | Similar to 'readSheet', but will avoid allocating more memory
+-- than you use in reading 'SheetItem's.
+--
+-- To use this, when supplying the function to consume the sheet's rows,
+-- you can choose to 'Continue' reading the sheet or 'Stop' early - if
+-- you choose to 'Stop', no more rows from the sheet will be loaded into
+-- memory, and the consumer will not be called again.
+readPartialSheet ::
+  -- | Sheet r:id, as represented by 'sheetInfoRelId' (obtainable via
+  -- 'getWorkbookInfo')
+  SheetIndex ->
+  -- | Function to consume the sheet's rows
+  (SheetItem -> IO Continue) ->
+  -- | Returns False if sheet doesn't exist, or True otherwise
+  XlsxM Bool
+readPartialSheet (MkSheetIndex sheetId) inner = do
   mSrc :: Maybe (ConduitT () ByteString (C.ResourceT IO) ()) <-
     getSheetXmlSource sheetId
   let

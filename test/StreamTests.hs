@@ -1,3 +1,4 @@
+{-# LANGUAGE NumericUnderscores #-}
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE QuasiQuotes       #-}
 {-# LANGUAGE TupleSections     #-}
@@ -33,6 +34,7 @@ import Data.Set.Lens
 import Data.ByteString.Lazy (ByteString)
 import qualified Data.ByteString.Lazy as LB
 import qualified Data.ByteString as BS
+import Data.IORef (modifyIORef', newIORef, readIORef)
 import Data.Map (Map)
 import qualified Data.Map as M
 import qualified Data.Map as Map
@@ -44,6 +46,7 @@ import qualified Data.Text as Text
 import Data.Vector (Vector, indexed, toList)
 import Diff
 import System.Directory (getTemporaryDirectory)
+import System.Mem (disableAllocationLimit, enableAllocationLimit, setAllocationCounter)
 import System.FilePath.Posix
 import Test.Tasty (TestName, TestTree, testGroup)
 import Test.Tasty.HUnit (testCase)
@@ -72,6 +75,10 @@ tests =
       [ testProperty "Input same as the output" sharedStringInputSameAsOutput
       , testProperty "Set of input texts is same as map length" sharedStringInputTextsIsSameAsMapLength
       , testProperty "Set of input texts is as value set length" sharedStringInputTextsIsSameAsValueSetLength
+      ],
+
+      testGroup "Reader/partial reading"
+      [ testCase "Read part of a large workbook, don't hit allocation limit" $ readPartial bigWorkbook
       ],
 
       testGroup "Reader/Writer"
@@ -103,6 +110,44 @@ readWrite input = do
       input @==?  result
     Left x -> do
       throwIO x
+
+readPartial :: Xlsx -> IO ()
+readPartial input = do
+  BS.writeFile "testinput.xlsx" (toBs input)
+
+  -- This constrains roughly how much memory the thread can allocate
+  -- to 10MB (i.e. not enough to create all the 'SheetItem's for reading
+  -- a decently-sized workbook.)
+  setAllocationCounter 10_000_000
+  enableAllocationLimit
+
+  -- When we read the sheet normally, we allocate all the 'SheetItem's,
+  -- even if they're not used. This hits the limit.
+  eiException <- try $ void $ runXlsxM "testinput.xlsx" $ readSheet (makeIndex 1) (const $ pure ())
+  case eiException of
+    Right () -> error "Should have hit the allocation limit when reading the whole sheet"
+    Left AllocationLimitExceeded -> pure ()
+
+  setAllocationCounter 10_000_000
+
+  -- When we read the sheet partially, we can prevent the allocation of
+  -- 'SheetItem's after a point by saying that we're done with the read,
+  -- using 'Stop'
+  ioRef <- newIORef 0
+  void $ runXlsxM "testinput.xlsx" $ readPartialSheet (makeIndex 1) $ \_sheetItem -> do
+    curCount <- readIORef ioRef
+    if curCount >= 100
+      then pure Stop
+      else modifyIORef' ioRef (+1) >> pure Continue
+
+  setAllocationCounter 10_000_000
+
+  -- But we can still read too much with 'readPartialSheet', if we don't stop
+  -- early
+  eiException <- try $ void $ runXlsxM "testinput.xlsx" $ readPartialSheet (makeIndex 1) (const $ pure Continue)
+  case eiException of
+    Right () -> error "Should have hit the allocation limit when reading the whole sheet"
+    Left AllocationLimitExceeded -> pure ()
 
 -- test if the input text is also the result (a property we use for convenience)
 sharedStringInputSameAsOutput :: Text -> Either String String
