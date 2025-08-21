@@ -57,6 +57,7 @@ import Data.Tuple (swap)
 import GHC.Generics (Generic)
 import Prelude hiding (mapM)
 import Safe (headNote, fromJustNote)
+import Control.Monad (unless, guard, forM)
 
 import Codec.Xlsx.Types
 
