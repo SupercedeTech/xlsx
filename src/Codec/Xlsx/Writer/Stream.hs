@@ -71,6 +71,7 @@ import Text.XML (toXMLElement)
 import qualified Text.XML as TXML
 import Text.XML.Stream.Render
 import Text.XML.Unresolved (elementToEvents)
+import Control.Monad (void, when, unless)
 
 
 upsertSharedStrings :: MonadState SharedStringState m => Row -> m [(Text,Int)]
@@ -264,7 +265,7 @@ writeSst sharedStrings' = doc (n_ "sst") $
                   ) $ sortBy (\(_, i) (_, y :: Int) -> compare i y) $ Map.toList sharedStrings'
 
 writeEvents ::  PrimMonad m => ConduitT Event Builder m ()
-writeEvents = renderBuilder (def {rsPretty=False})
+writeEvents = renderBuilder def
 
 sheetViews :: forall m . MonadReader SheetWriteSettings m => forall i . ConduitT i Event m ()
 sheetViews = do
